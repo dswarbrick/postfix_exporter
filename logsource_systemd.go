@@ -47,9 +47,9 @@ func NewSystemdLogSource(path, unit, slice string) (*SystemdLogSource, error) {
 	}
 
 	if slice != "" {
-		jrConfig.Matches = []sdjournal.Match{{"_SYSTEMD_SLICE", slice}}
+		jrConfig.Matches = []sdjournal.Match{{Field: "_SYSTEMD_SLICE", Value: slice}}
 	} else if unit != "" {
-		jrConfig.Matches = []sdjournal.Match{{"_SYSTEMD_UNIT", unit}}
+		jrConfig.Matches = []sdjournal.Match{{Field: "_SYSTEMD_UNIT", Value: unit}}
 	}
 
 	jr, err := sdjournal.NewJournalReader(jrConfig)
@@ -76,6 +76,8 @@ func NewSystemdLogSource(path, unit, slice string) (*SystemdLogSource, error) {
 }
 
 func (s *SystemdLogSource) Close() error {
+	// Stop JournalReader follower
+	s.untilCh <- time.Now()
 	return s.jReader.Close()
 }
 
@@ -90,8 +92,6 @@ func (s *SystemdLogSource) Read(ctx context.Context) (string, error) {
 	case err := <-s.errCh:
 		return "", err
 	case <-ctx.Done():
-		// Stop JournalReader follower.
-		s.untilCh <- time.Now()
 		return "", ctx.Err()
 	}
 }
