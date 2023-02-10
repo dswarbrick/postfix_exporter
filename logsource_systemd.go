@@ -1,3 +1,4 @@
+//go:build !nosystemd && linux
 // +build !nosystemd,linux
 
 package main
@@ -5,7 +6,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"io"
 	"log"
 	"time"
 
@@ -19,54 +19,64 @@ var timeNow = time.Now
 // A SystemdLogSource reads log records from the given Systemd
 // journal.
 type SystemdLogSource struct {
-	journal SystemdJournal
+	jReader *sdjournal.JournalReader
 	path    string
-}
-
-// A SystemdJournal is the journal interface that sdjournal.Journal
-// provides. See https://pkg.go.dev/github.com/coreos/go-systemd/sdjournal?tab=doc
-type SystemdJournal interface {
-	io.Closer
-	AddMatch(match string) error
-	GetEntry() (*sdjournal.JournalEntry, error)
-	Next() (uint64, error)
-	SeekRealtimeUsec(usec uint64) error
-	Wait(timeout time.Duration) int
+	untilCh chan time.Time
+	entryCh chan string
+	errCh   chan error
 }
 
 // NewSystemdLogSource returns a log source for reading Systemd
 // journal entries. `unit` and `slice` provide filtering if non-empty
 // (with `slice` taking precedence).
-func NewSystemdLogSource(j SystemdJournal, path, unit, slice string) (*SystemdLogSource, error) {
-	logSrc := &SystemdLogSource{journal: j, path: path}
+func NewSystemdLogSource(path, unit, slice string) (*SystemdLogSource, error) {
+	jrConfig := sdjournal.JournalReaderConfig{
+		NumFromTail: 1,
+		Path:        path,
+		Formatter: func(e *sdjournal.JournalEntry) (string, error) {
+			ts := time.Unix(0, int64(e.RealtimeTimestamp)*int64(time.Microsecond))
+			return fmt.Sprintf(
+				"%s %s %s[%s]: %s",
+				ts.Format(time.Stamp),
+				e.Fields["_HOSTNAME"],
+				e.Fields["SYSLOG_IDENTIFIER"],
+				e.Fields["_PID"],
+				e.Fields["MESSAGE"],
+			), nil
+		},
+	}
 
-	var err error
 	if slice != "" {
-		err = logSrc.journal.AddMatch("_SYSTEMD_SLICE=" + slice)
+		jrConfig.Matches = []sdjournal.Match{{"_SYSTEMD_SLICE", slice}}
 	} else if unit != "" {
-		err = logSrc.journal.AddMatch("_SYSTEMD_UNIT=" + unit)
+		jrConfig.Matches = []sdjournal.Match{{"_SYSTEMD_UNIT", unit}}
 	}
+
+	jr, err := sdjournal.NewJournalReader(jrConfig)
 	if err != nil {
-		logSrc.journal.Close()
 		return nil, err
 	}
 
-	// Start at end of journal
-	if err := logSrc.journal.SeekRealtimeUsec(uint64(timeNow().UnixNano() / 1000)); err != nil {
-		logSrc.journal.Close()
-		return nil, err
+	logSrc := &SystemdLogSource{
+		jReader: jr,
+		path:    path,
+		untilCh: make(chan time.Time),
+		entryCh: make(chan string),
+		errCh:   make(chan error),
 	}
 
-	if r := logSrc.journal.Wait(1 * time.Second); r < 0 {
-		logSrc.journal.Close()
-		return nil, err
-	}
+	go func() {
+		w := journalEntryWriter{logSrc.entryCh}
+		if err := logSrc.jReader.Follow(logSrc.untilCh, w); err != nil {
+			logSrc.errCh <- err
+		}
+	}()
 
 	return logSrc, nil
 }
 
 func (s *SystemdLogSource) Close() error {
-	return s.journal.Close()
+	return s.jReader.Close()
 }
 
 func (s *SystemdLogSource) Path() string {
@@ -74,28 +84,16 @@ func (s *SystemdLogSource) Path() string {
 }
 
 func (s *SystemdLogSource) Read(ctx context.Context) (string, error) {
-	c, err := s.journal.Next()
-	if err != nil {
+	select {
+	case e := <-s.entryCh:
+		return e, nil
+	case err := <-s.errCh:
 		return "", err
+	case <-ctx.Done():
+		// Stop JournalReader follower.
+		s.untilCh <- time.Now()
+		return "", ctx.Err()
 	}
-	if c == 0 {
-		return "", io.EOF
-	}
-
-	e, err := s.journal.GetEntry()
-	if err != nil {
-		return "", err
-	}
-	ts := time.Unix(0, int64(e.RealtimeTimestamp)*int64(time.Microsecond))
-
-	return fmt.Sprintf(
-		"%s %s %s[%s]: %s",
-		ts.Format(time.Stamp),
-		e.Fields["_HOSTNAME"],
-		e.Fields["SYSLOG_IDENTIFIER"],
-		e.Fields["_PID"],
-		e.Fields["MESSAGE"],
-	), nil
 }
 
 // A systemdLogSourceFactory is a factory that can create
@@ -118,24 +116,17 @@ func (f *systemdLogSourceFactory) New(ctx context.Context) (LogSourceCloser, err
 	}
 
 	log.Println("Reading log events from systemd")
-	j, path, err := newSystemdJournal(f.path)
-	if err != nil {
-		return nil, err
-	}
-	return NewSystemdLogSource(j, path, f.unit, f.slice)
+	return NewSystemdLogSource(f.path, f.unit, f.slice)
 }
 
-// newSystemdJournal creates a journal handle. It returns the handle
-// and a string representation of it. If `path` is empty, it connects
-// to the local journald.
-func newSystemdJournal(path string) (*sdjournal.Journal, string, error) {
-	if path != "" {
-		j, err := sdjournal.NewJournalFromDir(path)
-		return j, path, err
-	}
+// journalEntryWriter implements the io.Writer interface.
+type journalEntryWriter struct {
+	entryCh chan string
+}
 
-	j, err := sdjournal.NewJournal()
-	return j, "journald", err
+func (w journalEntryWriter) Write(b []byte) (int, error) {
+	w.entryCh <- string(b)
+	return len(b), nil
 }
 
 func init() {
