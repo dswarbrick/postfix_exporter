@@ -1,3 +1,4 @@
+//go:build !nosystemd && linux
 // +build !nosystemd,linux
 
 package main
@@ -21,6 +22,8 @@ var timeNow = time.Now
 type SystemdLogSource struct {
 	journal SystemdJournal
 	path    string
+	entryCh chan sdjournal.JournalEntry
+	errCh   chan error
 }
 
 // A SystemdJournal is the journal interface that sdjournal.Journal
@@ -57,10 +60,42 @@ func NewSystemdLogSource(j SystemdJournal, path, unit, slice string) (*SystemdLo
 		return nil, err
 	}
 
-	if r := logSrc.journal.Wait(1 * time.Second); r < 0 {
-		logSrc.journal.Close()
-		return nil, err
-	}
+	logSrc.entryCh = make(chan sdjournal.JournalEntry)
+	logSrc.errCh = make(chan error)
+
+	// Simple systemd journal tailer
+	go func() {
+		for {
+			status := logSrc.journal.Wait(100 * time.Millisecond)
+			switch status {
+			case sdjournal.SD_JOURNAL_NOP:
+				// Journal did not change since last invocation
+			case sdjournal.SD_JOURNAL_APPEND, sdjournal.SD_JOURNAL_INVALIDATE:
+				for {
+					c, err := logSrc.journal.Next()
+					if err != nil {
+						logSrc.errCh <- err
+						return
+					}
+
+					// Resume Journal.Wait loop if we are at EOF
+					if c == 0 {
+						break
+					}
+
+					entry, err := logSrc.journal.GetEntry()
+					if err != nil {
+						logSrc.errCh <- err
+						return
+					}
+
+					logSrc.entryCh <- *entry
+				}
+			default:
+				fmt.Printf("unhandled status: %d\n", status)
+			}
+		}
+	}()
 
 	return logSrc, nil
 }
@@ -74,28 +109,22 @@ func (s *SystemdLogSource) Path() string {
 }
 
 func (s *SystemdLogSource) Read(ctx context.Context) (string, error) {
-	c, err := s.journal.Next()
-	if err != nil {
+	select {
+	case e := <-s.entryCh:
+		ts := time.Unix(0, int64(e.RealtimeTimestamp)*int64(time.Microsecond))
+		return fmt.Sprintf(
+			"%s %s %s[%s]: %s",
+			ts.Format(time.Stamp),
+			e.Fields["_HOSTNAME"],
+			e.Fields["SYSLOG_IDENTIFIER"],
+			e.Fields["_PID"],
+			e.Fields["MESSAGE"],
+		), nil
+	case err := <-s.errCh:
 		return "", err
+	case <-ctx.Done():
+		return "", ctx.Err()
 	}
-	if c == 0 {
-		return "", io.EOF
-	}
-
-	e, err := s.journal.GetEntry()
-	if err != nil {
-		return "", err
-	}
-	ts := time.Unix(0, int64(e.RealtimeTimestamp)*int64(time.Microsecond))
-
-	return fmt.Sprintf(
-		"%s %s %s[%s]: %s",
-		ts.Format(time.Stamp),
-		e.Fields["_HOSTNAME"],
-		e.Fields["SYSLOG_IDENTIFIER"],
-		e.Fields["_PID"],
-		e.Fields["MESSAGE"],
-	), nil
 }
 
 // A systemdLogSourceFactory is a factory that can create
